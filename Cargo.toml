@@ -1,0 +1,23 @@
+[package]
+name = "keycdn-api"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[workspace.dependencies]
+tracing = "0.1.44"
+tokio = { version = "1.54.1", features = ["time", "sync"] }
+
+[dependencies]
+reqwest = "0.13.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3.34"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
