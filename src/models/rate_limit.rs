@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroU32, sync::Arc};
+use std::{
+    collections::VecDeque,
+    num::NonZeroU32,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 use tokio::{
-    runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Represents a rate limit configuration for API requests.
@@ -76,20 +79,41 @@ impl RateLimit {
 ///
 /// A single limiter should be shared (e.g. behind an [`Arc`]) by everything
 /// that talks to the same API, since the limit applies to the client as a
-/// whole.
+/// whole. It may be shared across Tokio runtimes, and outlive them: slot
+/// release times are recorded in the limiter itself rather than in tasks on
+/// a runtime.
 #[derive(Debug)]
 pub struct RateLimiter {
+    /// One permit per slot; makes callers wait while every slot is in use.
     semaphore: Arc<Semaphore>,
+    /// When each slot that is not in use becomes free, earliest first. There
+    /// is always one entry per available semaphore permit.
+    free_at: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: RateLimit,
 }
 
 impl From<RateLimit> for RateLimiter {
     fn from(rate_limit: RateLimit) -> Self {
+        let slots = rate_limit.max_requests.get() as usize;
         RateLimiter {
-            semaphore: Arc::new(Semaphore::new(rate_limit.max_requests.get() as usize)),
+            semaphore: Arc::new(Semaphore::new(slots)),
+            free_at: Arc::new(Mutex::new(VecDeque::from(vec![Instant::now(); slots]))),
             rate_limit,
         }
     }
+}
+
+/// Locks the queue of slot release times, ignoring poisoning: the queue is
+/// never left in an inconsistent state, so a panic elsewhere doesn't matter.
+fn lock(free_at: &Mutex<VecDeque<Instant>>) -> MutexGuard<'_, VecDeque<Instant>> {
+    free_at.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Returns a slot that becomes free at `at`, keeping the queue sorted.
+fn return_slot(free_at: &Mutex<VecDeque<Instant>>, at: Instant) {
+    let mut free_at = lock(free_at);
+    let index = free_at.partition_point(|&t| t <= at);
+    free_at.insert(index, at);
 }
 
 impl RateLimiter {
@@ -103,9 +127,9 @@ impl RateLimiter {
     ///
     /// # Panics
     ///
-    /// Panics if not called from within a Tokio runtime.
+    /// Panics if it has to wait for a slot outside of a Tokio runtime with
+    /// the time driver enabled.
     pub async fn acquire(&self) -> RateLimitPermit {
-        let handle = Handle::current();
         tracing::trace!(
             "Acquiring permit for rate limit: {:?} requests per {:?}",
             self.rate_limit.max_requests,
@@ -115,29 +139,44 @@ impl RateLimiter {
             .acquire_owned()
             .await
             .expect("the rate limiter's semaphore is never closed");
+
+        // Holding a semaphore permit guarantees there is an entry to take.
+        let free_at = lock(&self.free_at)
+            .pop_front()
+            .expect("there is one free slot per available permit");
+        // If this future is cancelled while waiting, `pending` puts the slot
+        // back unused before `permit` is released (locals drop in reverse).
+        let mut pending = PendingSlot {
+            free_at: &self.free_at,
+            at: Some(free_at),
+        };
+        tokio::time::sleep_until(free_at).await;
+        pending.at = None;
+
         tracing::trace!(
             "Permit acquired for rate limit: {:?} requests per {:?}",
             self.rate_limit.max_requests,
             self.rate_limit.duration
         );
         RateLimitPermit {
-            permit: Some(permit),
+            _permit: permit,
+            free_at: Arc::clone(&self.free_at),
             delay: self.rate_limit.duration,
-            handle,
         }
     }
 
     /// Waits until a request is allowed under the rate limit, then executes
     /// the provided future and returns its output.
     ///
-    /// The output is returned as soon as `f` completes; the slot is released
-    /// [`RateLimit::duration`] after that in the background. If this future is
+    /// The output is returned as soon as `f` completes; the slot becomes
+    /// available again [`RateLimit::duration`] after that. If this future is
     /// cancelled while `f` is running, the slot is still held for the full
     /// duration, since the request may already have reached the server.
     ///
     /// # Panics
     ///
-    /// Panics if not called from within a Tokio runtime.
+    /// Panics if it has to wait for a slot outside of a Tokio runtime with
+    /// the time driver enabled.
     pub async fn acquire_and_execute<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T>,
@@ -147,33 +186,42 @@ impl RateLimiter {
     }
 }
 
+/// A slot taken from the queue by [`RateLimiter::acquire`] while it waits for
+/// the slot's release time. If the wait is cancelled, the slot is returned
+/// with its original release time, since no request was made with it.
+struct PendingSlot<'a> {
+    free_at: &'a Mutex<VecDeque<Instant>>,
+    at: Option<Instant>,
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(at) = self.at.take() {
+            return_slot(self.free_at, at);
+        }
+    }
+}
+
 /// A slot under a [`RateLimiter`], obtained from [`RateLimiter::acquire`].
 ///
-/// Dropping the permit schedules the slot to be released after
-/// [`RateLimit::duration`]; it does not release it immediately.
+/// Dropping the permit makes the slot available again after
+/// [`RateLimit::duration`], not immediately. It can be dropped anywhere,
+/// including outside of a Tokio runtime.
 #[derive(Debug)]
 #[must_use = "dropping the permit starts its release timer immediately; bind it with `let _permit = ...` until the request completes"]
 pub struct RateLimitPermit {
-    permit: Option<OwnedSemaphorePermit>,
+    /// Released after `drop` has returned the slot to the queue, so a waiter
+    /// woken by the semaphore always finds an entry.
+    _permit: OwnedSemaphorePermit,
+    free_at: Arc<Mutex<VecDeque<Instant>>>,
     delay: Duration,
-    /// Captured at acquisition so that the release can be scheduled even if
-    /// the permit is dropped outside of the runtime's context.
-    handle: Handle,
 }
 
 impl Drop for RateLimitPermit {
     fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() {
-            let delay = self.delay;
-            // If the runtime has shut down, the task never runs and the
-            // semaphore permit is simply dropped along with it, which is fine
-            // since nothing can be waiting on the limiter any more.
-            self.handle.spawn(async move {
-                tokio::time::sleep(delay).await;
-                drop(permit);
-                tracing::trace!("Rate limit duration {:?} elapsed, permit released", delay);
-            });
-        }
+        let at = Instant::now() + self.delay;
+        return_slot(&self.free_at, at);
+        tracing::trace!("Permit returned; slot free again in {:?}", self.delay);
     }
 }
 
@@ -187,7 +235,6 @@ mod tests {
     use super::*;
     use crate::logging;
     use futures::future::join_all;
-    use tokio::time::Instant;
 
     const WINDOW: Duration = Duration::from_millis(100);
 
@@ -421,6 +468,59 @@ mod tests {
                 start.elapsed()
             });
             assert_eq!(elapsed, WINDOW);
+        }
+
+        /// A caller cancelled while waiting for a slot must put it back
+        /// unused, with its original release time.
+        #[tokio::test(start_paused = true)]
+        async fn cancelled_wait_returns_slot_unused() {
+            logging::init_test_tracing();
+
+            let rate_limiter = limiter(1);
+            let start = Instant::now();
+            // The only slot is now free again at 100ms.
+            drop(rate_limiter.acquire().await);
+
+            // Gives up waiting for it at 10ms.
+            let cancelled =
+                tokio::time::timeout(Duration::from_millis(10), rate_limiter.acquire()).await;
+            assert!(cancelled.is_err(), "acquire should have timed out");
+
+            // If the slot had been lost this would wait forever, and if it had
+            // been treated as used it would wait until 110ms.
+            let _permit = rate_limiter.acquire().await;
+            assert_eq!(start.elapsed(), WINDOW);
+        }
+
+        /// A limiter that outlives the runtime it was used on (e.g. one shared
+        /// by several `#[tokio::test]`s) must still hold released slots for
+        /// the full window.
+        #[test]
+        fn limiter_outlives_its_runtime() {
+            logging::init_test_tracing();
+
+            let runtime = || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+            };
+            let rate_limiter = limiter(1);
+
+            let first = runtime();
+            first.block_on(async { drop(rate_limiter.acquire().await) });
+            drop(first);
+
+            let start = std::time::Instant::now();
+            runtime().block_on(async { drop(rate_limiter.acquire().await) });
+            let elapsed = start.elapsed();
+
+            // Real time, so only a lower bound is reliable; the slot was
+            // released only moments before `start`.
+            assert!(
+                elapsed >= WINDOW / 2,
+                "second runtime acquired after {elapsed:?}, window is {WINDOW:?}"
+            );
         }
     }
 }
