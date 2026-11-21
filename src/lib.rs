@@ -3,7 +3,17 @@
 //! Currently only supports the
 //! [IP Location Finder API](https://tools.keycdn.com/geo#ip-location-finder-api).
 
+pub mod error;
 pub mod models;
+
+pub use error::{Error, Result};
+
+/// Re-export the commonly used types from the `models` module for convenience.
+pub mod prelude {
+    pub use crate::error::{Error, Result};
+    pub use crate::models::api::location_lookup::LocationLookupResult;
+    pub use crate::models::session::Session;
+}
 
 #[cfg(test)]
 #[allow(unused)]

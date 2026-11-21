@@ -7,17 +7,26 @@ edition = "2024"
 members = ["."]
 
 [workspace.dependencies]
-tracing = "0.1.44"
-tokio = { version = "1.54.1", features = ["time", "sync"] }
+tracing = "0.1"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+
+[features]
+default = ["rustls"]
+rustls = ["reqwest/rustls"]
+native-tls = ["reqwest/native-tls"]
+test-integration = []
 
 [dependencies]
-reqwest = "0.13.5"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "json", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3.25"
+thiserror = "2.0"
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = "2.5"
 
 [dev-dependencies]
-futures = "0.3.34"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+futures = "0.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
