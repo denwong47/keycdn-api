@@ -1,5 +1,11 @@
 # keycdn-api
 
+> [!WARNING]
+>
+> **Deprecated**. This crate will be unmaintained going forward.
+>
+> Superseded by [`common-tools-api`](https://github.com/denwong47/common-tools-api).
+
 A small async Rust client for the [KeyCDN](https://www.keycdn.com/) tools API.
 
 It currently supports only the
